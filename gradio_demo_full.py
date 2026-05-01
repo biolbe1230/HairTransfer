@@ -16,14 +16,17 @@ from utils.pipeline_cn import StableDiffusionControlNetPipeline
 
 
 class StableHair:
-    def __init__(self, config="./configs/hair_transfer.yaml", device="cuda", weight_dtype=torch.float32) -> None:
+    def __init__(self, config="stable_hair/configs/hair_transfer.yaml", device="cuda", weight_dtype=torch.float16) -> None:
         print("Initializing Stable Hair Pipeline...")
         self.config = OmegaConf.load(config)
-        self.device = device
+        self.device_main = "cuda:0"
+        self.device_ref = "cuda:1"
+        self.device_bald = "cuda:2"
+        self.device_unet = "cuda:3"
 
-        ### Load vae controlnet
-        unet = UNet2DConditionModel.from_pretrained(self.config.pretrained_model_path, subfolder="unet").to(device)
-        controlnet = ControlNetModel.from_unet(unet).to(device)
+        ### Load controlnet
+        unet = UNet2DConditionModel.from_pretrained(self.config.pretrained_model_path, subfolder="unet").to(self.device_unet)
+        controlnet = ControlNetModel.from_unet(unet).to(self.device_main)
         _state_dict = torch.load(os.path.join(self.config.pretrained_folder, self.config.controlnet_path))
         controlnet.load_state_dict(_state_dict, strict=False)
         controlnet.to(weight_dtype)
@@ -34,19 +37,19 @@ class StableHair:
             controlnet=controlnet,
             safety_checker=None,
             torch_dtype=weight_dtype,
-        ).to(device)
-        self.pipeline.scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config)
+        ).to(self.device_main)
+        self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
 
         ### load Hair encoder/adapter
-        self.hair_encoder = ref_unet.from_pretrained(self.config.pretrained_model_path, subfolder="unet").to(device)
+        self.hair_encoder = ref_unet.from_pretrained(self.config.pretrained_model_path, subfolder="unet").to(self.device_ref)
         _state_dict = torch.load(os.path.join(self.config.pretrained_folder, self.config.encoder_path))
         self.hair_encoder.load_state_dict(_state_dict, strict=False)
-        self.hair_adapter = adapter_injection(self.pipeline.unet, device=self.device, dtype=torch.float16, use_resampler=False)
+        self.hair_adapter = adapter_injection(self.pipeline.unet, device=self.device_ref, dtype=torch.float16, use_resampler=False)
         _state_dict = torch.load(os.path.join(self.config.pretrained_folder, self.config.adapter_path))
         self.hair_adapter.load_state_dict(_state_dict, strict=False)
 
         ### load bald converter
-        bald_converter = ControlNetModel.from_unet(unet).to(device)
+        bald_converter = ControlNetModel.from_unet(unet).to(self.device_bald)
         _state_dict = torch.load(self.config.bald_converter_path)
         bald_converter.load_state_dict(_state_dict, strict=False)
         bald_converter.to(dtype=weight_dtype)
@@ -59,8 +62,9 @@ class StableHair:
             safety_checker=None,
             torch_dtype=weight_dtype,
         )
-        self.remove_hair_pipeline.scheduler = UniPCMultistepScheduler.from_config(self.remove_hair_pipeline.scheduler.config)
-        self.remove_hair_pipeline = self.remove_hair_pipeline.to(device)
+        self.remove_hair_pipeline.scheduler = UniPCMultistepScheduler.from_config(
+            self.remove_hair_pipeline.scheduler.config)
+        self.remove_hair_pipeline = self.remove_hair_pipeline.to(self.device_bald)
 
         ### move to fp16
         self.hair_encoder.to(weight_dtype)
@@ -76,7 +80,8 @@ class StableHair:
         guidance_scale = float(guidance_scale)
         scale = float(scale)
         controlnet_conditioning_scale = float(controlnet_conditioning_scale)
-
+        self.hair_encoder.to(self.device_main)
+        self.hair_adapter.to(self.device_main)
         # load imgs
         H, W, C = source_image.shape
 
